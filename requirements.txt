@@ -1,0 +1,17 @@
+fastapi
+uvicorn[standard]
+python-dotenv
+python-jose[cryptography]
+passlib[bcrypt]==1.7.4
+bcrypt==4.0.1
+motor
+pymongo
+python-multipart
+pillow
+numpy
+onnxruntime
+cloudinary
+openai
+gdown
+pydantic[email]
+email-validator

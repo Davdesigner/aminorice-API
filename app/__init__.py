@@ -1,0 +1,1 @@
+"""AminoRice FastAPI application package."""
