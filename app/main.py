@@ -65,7 +65,17 @@ openai_client  = OpenAI(api_key=OPENAI_API_KEY)
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_MODEL_PATH = os.path.join(PROJECT_ROOT, "Saved_model", "Final_Best_model.onnx")
-ONNX_MODEL_PATH = os.getenv("MODEL_PATH", DEFAULT_MODEL_PATH)
+
+
+def resolve_model_path() -> str:
+    """Resolve MODEL_PATH environment value to an absolute filesystem path."""
+    env_path = os.getenv("MODEL_PATH")
+    if not env_path:
+        return DEFAULT_MODEL_PATH
+    return env_path if os.path.isabs(env_path) else os.path.abspath(os.path.join(PROJECT_ROOT, env_path))
+
+
+ONNX_MODEL_PATH = resolve_model_path()
 
 IMG_H = 640
 IMG_W = 640
@@ -264,6 +274,7 @@ class MongoDB:
 
 mongodb      = MongoDB()
 onnx_session = None
+onnx_load_error: Optional[str] = None
 
 
 async def get_database():
@@ -314,17 +325,25 @@ def _create_onnx_session(model_path: str) -> ort.InferenceSession:
 
 
 def get_model() -> ort.InferenceSession:
-    global onnx_session
+    global onnx_session, onnx_load_error
 
     if onnx_session is None:
         if not is_model_valid(ONNX_MODEL_PATH):
-            raise RuntimeError(
+            onnx_load_error = (
                 f"ONNX model file is missing or empty at: {ONNX_MODEL_PATH}. "
                 "Ensure Saved_model/Final_Best_model.onnx is committed to the repo "
                 "or set MODEL_PATH to a valid absolute path."
             )
+            raise RuntimeError(
+                onnx_load_error
+            )
 
-        onnx_session = _create_onnx_session(ONNX_MODEL_PATH)
+        try:
+            onnx_session = _create_onnx_session(ONNX_MODEL_PATH)
+            onnx_load_error = None
+        except Exception as e:
+            onnx_load_error = str(e)
+            raise
 
     return onnx_session
 
@@ -348,7 +367,12 @@ async def startup():
     else:
         print(f"  ⚠  Model file missing or empty at: {ONNX_MODEL_PATH}")
 
-    print("ℹ️ ONNX model session will be lazy-loaded on first prediction request")
+    # Force model loading at boot so health check reflects real readiness.
+    try:
+        get_model()
+        print("✅ ONNX model loaded at startup")
+    except Exception as e:
+        print(f"❌ ONNX model load failed at startup: {e}")
 
     if TRANSFORM_STATS is None:
         print("\n⚠  TRANSFORM_STATS is None — run extract_stats.py and paste output into app/main.py")
@@ -1013,8 +1037,9 @@ async def health_check():
         "onnx_model"      : (
             "loaded"
             if onnx_session is not None
-            else ("ready (lazy load)" if is_model_valid(ONNX_MODEL_PATH) else "missing")
+            else ("error" if onnx_load_error else "missing")
         ),
+        "onnx_model_error": onnx_load_error,
         "onnx_model_path" : ONNX_MODEL_PATH,
         "transform_stats" : "loaded" if TRANSFORM_STATS is not None else "MISSING — run extract_stats.py",
         "model_info"      : {
