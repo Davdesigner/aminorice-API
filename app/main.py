@@ -63,7 +63,9 @@ ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", 10080
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 openai_client  = OpenAI(api_key=OPENAI_API_KEY)
 
-ONNX_MODEL_PATH = os.getenv("MODEL_PATH", "Saved_model/Final_Best_model.onnx")
+IS_VERCEL = os.getenv("VERCEL") == "1"
+DEFAULT_MODEL_PATH = "/tmp/Final_Best_model.onnx" if IS_VERCEL else "Saved_model/Final_Best_model.onnx"
+ONNX_MODEL_PATH = os.getenv("MODEL_PATH", DEFAULT_MODEL_PATH)
 GDRIVE_ONNX_ID  = os.getenv("GDRIVE_ONNX_ID", "")
 
 IMG_H = 640
@@ -266,7 +268,17 @@ onnx_session = None
 
 
 async def get_database():
+    await ensure_mongo_connected()
     return mongodb.client[DATABASE_NAME]
+
+
+async def ensure_mongo_connected() -> None:
+    if mongodb.client is not None:
+        return
+    if not MONGODB_URL:
+        raise RuntimeError("MONGODB_URL environment variable is required")
+    mongodb.client = AsyncIOMotorClient(MONGODB_URL)
+    await mongodb.client.admin.command("ping")
 
 
 def _file_size_mb(path: str) -> float:
@@ -293,7 +305,11 @@ def ensure_model_file(local_path: str, gdrive_id: str, label: str) -> bool:
     except ImportError:
         print("  ⚠  gdown not installed — pip install gdown")
         return False
-    os.makedirs(os.path.dirname(local_path) or ".", exist_ok=True)
+    try:
+        os.makedirs(os.path.dirname(local_path) or ".", exist_ok=True)
+    except OSError as e:
+        print(f"  ❌ Cannot create model directory for {label}: {e}")
+        return False
     try:
         print(f"  ⬇  Downloading {label} from Google Drive ...")
         out = gdown.download(f"https://drive.google.com/uc?id={gdrive_id}",
@@ -351,9 +367,8 @@ def get_model() -> ort.InferenceSession:
 @app.on_event("startup")
 async def startup():
     # MongoDB
-    mongodb.client = AsyncIOMotorClient(MONGODB_URL)
     try:
-        await mongodb.client.admin.command("ping")
+        await ensure_mongo_connected()
         print("✅ MongoDB connected")
     except Exception as e:
         print(f"❌ MongoDB error: {e}")
@@ -375,7 +390,9 @@ async def startup():
 
 @app.on_event("shutdown")
 async def shutdown():
-    mongodb.client.close()
+    if mongodb.client is not None:
+        mongodb.client.close()
+        mongodb.client = None
 
 
 # =============================================================================
@@ -1016,7 +1033,7 @@ async def rice_expert_chat(
 @app.get("/health")
 async def health_check():
     try:
-        await mongodb.client.admin.command("ping")
+        await ensure_mongo_connected()
         db_status = "connected"
     except Exception as e:
         db_status = f"error: {e}"
