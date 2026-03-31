@@ -12,6 +12,5 @@ numpy
 onnxruntime
 cloudinary
 openai
-gdown
 pydantic[email]
 email-validator

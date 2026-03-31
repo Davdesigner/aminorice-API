@@ -63,10 +63,9 @@ ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", 10080
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 openai_client  = OpenAI(api_key=OPENAI_API_KEY)
 
-IS_VERCEL = os.getenv("VERCEL") == "1"
-DEFAULT_MODEL_PATH = "/tmp/Final_Best_model.onnx" if IS_VERCEL else "Saved_model/Final_Best_model.onnx"
+PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DEFAULT_MODEL_PATH = os.path.join(PROJECT_ROOT, "Saved_model", "Final_Best_model.onnx")
 ONNX_MODEL_PATH = os.getenv("MODEL_PATH", DEFAULT_MODEL_PATH)
-GDRIVE_ONNX_ID  = os.getenv("GDRIVE_ONNX_ID", "")
 
 IMG_H = 640
 IMG_W = 640
@@ -286,42 +285,11 @@ def _file_size_mb(path: str) -> float:
     except: return 0.0
 
 
-def is_model_valid(path: str, min_size_mb: float = 50.0) -> bool:
-    """Return True only when the model file exists and looks complete."""
+def is_model_valid(path: str, min_size_mb: float = 0.001) -> bool:
+    """Return True when the model file exists and is non-empty."""
     if not os.path.exists(path):
         return False
     return _file_size_mb(path) >= min_size_mb
-
-
-def ensure_model_file(local_path: str, gdrive_id: str, label: str) -> bool:
-    if os.path.exists(local_path):
-        print(f"  ✅ {label} present ({_file_size_mb(local_path):.1f} MB)")
-        return True
-    if not gdrive_id:
-        print(f"  ⚠  {label} missing — set GDRIVE_ONNX_ID env var to auto-download")
-        return False
-    try:
-        import gdown
-    except ImportError:
-        print("  ⚠  gdown not installed — pip install gdown")
-        return False
-    try:
-        os.makedirs(os.path.dirname(local_path) or ".", exist_ok=True)
-    except OSError as e:
-        print(f"  ❌ Cannot create model directory for {label}: {e}")
-        return False
-    try:
-        print(f"  ⬇  Downloading {label} from Google Drive ...")
-        out = gdown.download(f"https://drive.google.com/uc?id={gdrive_id}",
-                             local_path, quiet=False, fuzzy=True)
-        if out is None or not os.path.exists(local_path):
-            print(f"  ❌ Download failed for {label}")
-            return False
-        print(f"  ✅ {label} downloaded ({_file_size_mb(local_path):.1f} MB)")
-        return True
-    except Exception as e:
-        print(f"  ❌ Download error: {e}")
-        return False
 
 
 def _create_onnx_session(model_path: str) -> ort.InferenceSession:
@@ -350,10 +318,11 @@ def get_model() -> ort.InferenceSession:
 
     if onnx_session is None:
         if not is_model_valid(ONNX_MODEL_PATH):
-            ensure_model_file(ONNX_MODEL_PATH, GDRIVE_ONNX_ID, "Final_Best_model.onnx")
-
-        if not os.path.exists(ONNX_MODEL_PATH):
-            raise RuntimeError("ONNX model file is missing")
+            raise RuntimeError(
+                f"ONNX model file is missing or empty at: {ONNX_MODEL_PATH}. "
+                "Ensure Saved_model/Final_Best_model.onnx is committed to the repo "
+                "or set MODEL_PATH to a valid absolute path."
+            )
 
         onnx_session = _create_onnx_session(ONNX_MODEL_PATH)
 
@@ -374,10 +343,10 @@ async def startup():
         print(f"❌ MongoDB error: {e}")
 
     # Model file
-    if not is_model_valid(ONNX_MODEL_PATH):
-        ensure_model_file(ONNX_MODEL_PATH, GDRIVE_ONNX_ID, "Final_Best_model.onnx")
+    if is_model_valid(ONNX_MODEL_PATH):
+        print(f"  ✅ Model file found ({_file_size_mb(ONNX_MODEL_PATH):.1f} MB)")
     else:
-        print(f"  ✅ Model already present, skipping download ({_file_size_mb(ONNX_MODEL_PATH):.1f} MB)")
+        print(f"  ⚠  Model file missing or empty at: {ONNX_MODEL_PATH}")
 
     print("ℹ️ ONNX model session will be lazy-loaded on first prediction request")
 
@@ -1041,7 +1010,12 @@ async def health_check():
     return {
         "status"          : "healthy",
         "database"        : db_status,
-        "onnx_model"      : "loaded" if onnx_session is not None else "not loaded",
+        "onnx_model"      : (
+            "loaded"
+            if onnx_session is not None
+            else ("ready (lazy load)" if is_model_valid(ONNX_MODEL_PATH) else "missing")
+        ),
+        "onnx_model_path" : ONNX_MODEL_PATH,
         "transform_stats" : "loaded" if TRANSFORM_STATS is not None else "MISSING — run extract_stats.py",
         "model_info"      : {
             "architecture": "ConvNeXtV2-Nano + Comment Embedding",
