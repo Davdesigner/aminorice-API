@@ -40,6 +40,7 @@ This repository is configured for Vercel Python runtime using:
 - `CLOUDINARY_API_SECRET`
 - `OPENAI_API_KEY`
 - `MODEL_PATH` (optional)
+- `ONNX_MODEL_URL` (optional, direct downloadable URL to the .onnx file)
 - `GDRIVE_ONNX_ID` (optional, used when model is downloaded on-demand)
 
 ## Vercel Notes

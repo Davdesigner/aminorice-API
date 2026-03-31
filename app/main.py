@@ -28,10 +28,13 @@ from passlib.context import CryptContext
 from motor.motor_asyncio import AsyncIOMotorClient
 from bson import ObjectId
 import os, math
+import shutil
 import numpy as np
 import gc
 from PIL import Image, ImageOps, UnidentifiedImageError
 import io
+from urllib.parse import quote_plus
+from urllib.request import Request, urlopen
 import onnxruntime as ort
 import cloudinary
 import cloudinary.uploader
@@ -64,7 +67,9 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 openai_client  = OpenAI(api_key=OPENAI_API_KEY)
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DEFAULT_MODEL_PATH = os.path.join(PROJECT_ROOT, "Saved_model", "Final_Best_model.onnx")
+BUNDLED_MODEL_PATH = os.path.join(PROJECT_ROOT, "Saved_model", "Final_Best_model.onnx")
+IS_VERCEL_RUNTIME = bool(os.getenv("VERCEL")) or PROJECT_ROOT.startswith("/var/task")
+DEFAULT_MODEL_PATH = "/tmp/Final_Best_model.onnx" if IS_VERCEL_RUNTIME else BUNDLED_MODEL_PATH
 
 
 def resolve_model_path() -> str:
@@ -277,6 +282,55 @@ onnx_session = None
 onnx_load_error: Optional[str] = None
 
 
+def _ensure_parent_dir(path: str) -> None:
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+
+def _download_model_to_path(url: str, dst_path: str, timeout_sec: int = 90) -> None:
+    """Download ONNX model bytes to destination path."""
+    _ensure_parent_dir(dst_path)
+    req = Request(url, headers={"User-Agent": "AminoRice-API/2.1"})
+    with urlopen(req, timeout=timeout_sec) as response:
+        content_type = (response.headers.get("Content-Type") or "").lower()
+        if "text/html" in content_type:
+            raise RuntimeError(
+                "Model URL returned HTML instead of ONNX bytes. "
+                "Use a direct download URL for ONNX_MODEL_URL."
+            )
+
+        with open(dst_path, "wb") as out:
+            shutil.copyfileobj(response, out)
+
+
+def _gdrive_download_url(file_id: str) -> str:
+    return f"https://drive.google.com/uc?export=download&id={quote_plus(file_id.strip())}"
+
+
+def ensure_model_present() -> str:
+    """Ensure model exists at runtime path; download/copy it when needed."""
+    if is_model_valid(ONNX_MODEL_PATH):
+        return ONNX_MODEL_PATH
+
+    # Fast path: if model is bundled in repo but runtime path points elsewhere, copy it.
+    if ONNX_MODEL_PATH != BUNDLED_MODEL_PATH and is_model_valid(BUNDLED_MODEL_PATH):
+        _ensure_parent_dir(ONNX_MODEL_PATH)
+        shutil.copy2(BUNDLED_MODEL_PATH, ONNX_MODEL_PATH)
+        if is_model_valid(ONNX_MODEL_PATH):
+            return ONNX_MODEL_PATH
+
+    model_url = os.getenv("ONNX_MODEL_URL")
+    gdrive_id = os.getenv("GDRIVE_ONNX_ID")
+
+    if model_url:
+        _download_model_to_path(model_url, ONNX_MODEL_PATH)
+    elif gdrive_id:
+        _download_model_to_path(_gdrive_download_url(gdrive_id), ONNX_MODEL_PATH)
+
+    return ONNX_MODEL_PATH
+
+
 async def get_database():
     await ensure_mongo_connected()
     return mongodb.client[DATABASE_NAME]
@@ -328,10 +382,12 @@ def get_model() -> ort.InferenceSession:
     global onnx_session, onnx_load_error
 
     if onnx_session is None:
+        ensure_model_present()
+
         if not is_model_valid(ONNX_MODEL_PATH):
             onnx_load_error = (
                 f"ONNX model file is missing or empty at: {ONNX_MODEL_PATH}. "
-                "Ensure Saved_model/Final_Best_model.onnx is committed to the repo "
+                "Set ONNX_MODEL_URL or GDRIVE_ONNX_ID to download the model at runtime, "
                 "or set MODEL_PATH to a valid absolute path."
             )
             raise RuntimeError(
@@ -362,8 +418,13 @@ async def startup():
         print(f"❌ MongoDB error: {e}")
 
     # Model file
+    try:
+        ensure_model_present()
+    except Exception as e:
+        print(f"  ⚠  Model materialization failed: {e}")
+
     if is_model_valid(ONNX_MODEL_PATH):
-        print(f"  ✅ Model file found ({_file_size_mb(ONNX_MODEL_PATH):.1f} MB)")
+        print(f"  ✅ Model file ready ({_file_size_mb(ONNX_MODEL_PATH):.1f} MB) at {ONNX_MODEL_PATH}")
     else:
         print(f"  ⚠  Model file missing or empty at: {ONNX_MODEL_PATH}")
 
