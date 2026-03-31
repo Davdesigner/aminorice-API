@@ -280,6 +280,7 @@ class MongoDB:
 mongodb      = MongoDB()
 onnx_session = None
 onnx_load_error: Optional[str] = None
+resolved_model_path: Optional[str] = None
 
 
 def _ensure_parent_dir(path: str) -> None:
@@ -305,30 +306,71 @@ def _download_model_to_path(url: str, dst_path: str, timeout_sec: int = 90) -> N
 
 
 def _gdrive_download_url(file_id: str) -> str:
-    return f"https://drive.google.com/uc?export=download&id={quote_plus(file_id.strip())}"
+    """
+    Build a direct Google Drive download URL that works for large files.
+
+    For files over ~40MB, drive.google.com/uc often returns an HTML warning
+    page. drive.usercontent.google.com with confirm=t returns file bytes.
+    """
+    return (
+        "https://drive.usercontent.google.com/download"
+        f"?id={quote_plus(file_id.strip())}&export=download&confirm=t"
+    )
 
 
 def ensure_model_present() -> str:
-    """Ensure model exists at runtime path; download/copy it when needed."""
+    """
+    Resolve model to a readable path, downloading if necessary.
+
+    On Vercel:
+      - /var/task is read-only and may not contain large ONNX files.
+      - /tmp is writable and survives warm invocations.
+      - We check /tmp first to avoid repeated downloads.
+    """
+    # 1) If configured path already has a valid model, use it.
     if is_model_valid(ONNX_MODEL_PATH):
         return ONNX_MODEL_PATH
 
-    # Fast path: if model is bundled in repo but runtime path points elsewhere, copy it.
-    if ONNX_MODEL_PATH != BUNDLED_MODEL_PATH and is_model_valid(BUNDLED_MODEL_PATH):
+    tmp_path = "/tmp/Final_Best_model.onnx"
+
+    # 2) On Vercel, reuse cached /tmp model across warm invocations.
+    if IS_VERCEL_RUNTIME and is_model_valid(tmp_path):
+        print(f"✅ Model found in /tmp cache ({_file_size_mb(tmp_path):.1f} MB)")
+        return tmp_path
+
+    # 3) Local/dev: copy bundled model when available.
+    if not IS_VERCEL_RUNTIME and is_model_valid(BUNDLED_MODEL_PATH):
         _ensure_parent_dir(ONNX_MODEL_PATH)
         shutil.copy2(BUNDLED_MODEL_PATH, ONNX_MODEL_PATH)
         if is_model_valid(ONNX_MODEL_PATH):
             return ONNX_MODEL_PATH
 
+    # 4) Download from runtime source.
     model_url = os.getenv("ONNX_MODEL_URL")
     gdrive_id = os.getenv("GDRIVE_ONNX_ID")
 
-    if model_url:
-        _download_model_to_path(model_url, ONNX_MODEL_PATH)
-    elif gdrive_id:
-        _download_model_to_path(_gdrive_download_url(gdrive_id), ONNX_MODEL_PATH)
+    dst = tmp_path if IS_VERCEL_RUNTIME else ONNX_MODEL_PATH
 
-    return ONNX_MODEL_PATH
+    if model_url:
+        print(f"⬇️ Downloading model from ONNX_MODEL_URL -> {dst}")
+        _download_model_to_path(model_url, dst)
+    elif gdrive_id:
+        print(f"⬇️ Downloading model from Google Drive -> {dst}")
+        _download_model_to_path(_gdrive_download_url(gdrive_id), dst)
+    else:
+        raise RuntimeError(
+            "Model file not found and no download source configured. "
+            "Set ONNX_MODEL_URL or GDRIVE_ONNX_ID in your environment variables."
+        )
+
+    if not is_model_valid(dst):
+        raise RuntimeError(
+            f"Model download appeared to succeed but file is invalid at {dst}. "
+            "Check that your Google Drive sharing is public and GDRIVE_ONNX_ID is correct."
+        )
+
+    print(f"✅ Model downloaded ({_file_size_mb(dst):.1f} MB) -> {dst}")
+    return dst
 
 
 async def get_database():
@@ -379,14 +421,15 @@ def _create_onnx_session(model_path: str) -> ort.InferenceSession:
 
 
 def get_model() -> ort.InferenceSession:
-    global onnx_session, onnx_load_error
+    global onnx_session, onnx_load_error, resolved_model_path
 
     if onnx_session is None:
-        ensure_model_present()
+        resolved_path = ensure_model_present()
+        resolved_model_path = resolved_path
 
-        if not is_model_valid(ONNX_MODEL_PATH):
+        if not is_model_valid(resolved_path):
             onnx_load_error = (
-                f"ONNX model file is missing or empty at: {ONNX_MODEL_PATH}. "
+                f"ONNX model file is missing or empty at: {resolved_path}. "
                 "Set ONNX_MODEL_URL or GDRIVE_ONNX_ID to download the model at runtime, "
                 "or set MODEL_PATH to a valid absolute path."
             )
@@ -395,7 +438,7 @@ def get_model() -> ort.InferenceSession:
             )
 
         try:
-            onnx_session = _create_onnx_session(ONNX_MODEL_PATH)
+            onnx_session = _create_onnx_session(resolved_path)
             onnx_load_error = None
         except Exception as e:
             onnx_load_error = str(e)
@@ -419,14 +462,17 @@ async def startup():
 
     # Model file
     try:
-        ensure_model_present()
+        materialized_path = ensure_model_present()
+        global resolved_model_path
+        resolved_model_path = materialized_path
     except Exception as e:
         print(f"  ⚠  Model materialization failed: {e}")
 
-    if is_model_valid(ONNX_MODEL_PATH):
-        print(f"  ✅ Model file ready ({_file_size_mb(ONNX_MODEL_PATH):.1f} MB) at {ONNX_MODEL_PATH}")
+    model_probe_path = resolved_model_path or ONNX_MODEL_PATH
+    if is_model_valid(model_probe_path):
+        print(f"  ✅ Model file ready ({_file_size_mb(model_probe_path):.1f} MB) at {model_probe_path}")
     else:
-        print(f"  ⚠  Model file missing or empty at: {ONNX_MODEL_PATH}")
+        print(f"  ⚠  Model file missing or empty at: {model_probe_path}")
 
     # Force model loading at boot so health check reflects real readiness.
     try:
@@ -1101,7 +1147,7 @@ async def health_check():
             else ("error" if onnx_load_error else "missing")
         ),
         "onnx_model_error": onnx_load_error,
-        "onnx_model_path" : ONNX_MODEL_PATH,
+        "onnx_model_path" : resolved_model_path or ONNX_MODEL_PATH,
         "transform_stats" : "loaded" if TRANSFORM_STATS is not None else "MISSING — run extract_stats.py",
         "model_info"      : {
             "architecture": "ConvNeXtV2-Nano + Comment Embedding",
